@@ -1,0 +1,153 @@
+---
+title: "Towards better distance measures in single-cell RNA-Seq"
+author: "Simon Anders"
+date: '2020-01-02'
+output:
+  html_document:
+    highlight: textmate
+    theme: cosmo
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set( dev='svg' )
+```
+
+### Model, notation, and problem statement
+
+Consider $n$ cells, the state of which is described by the expression of $m$ genes. Each cell $j$ is characterized by a vector $\mathbf{q}_j\in\mathbb{R}^m$, which denotes the cell's state in "logarithmic" expression space, i.e., the components $q_{ij}$ of $\mathbf{q}_j$ are proportional (in a sense specified below) to the logarithm of the concentration of mRNA molecules of gene $i$ in the plasma of cell $j$. 
+
+We write $K_{ij}$ for the number of UMIs detected for gene $i$ in cell $j$. The total number of UMIs received from cell $j$ is determined by a "size factor" $s_j$. We hence model the UMI counts as Poisson distributed according to
+$$ K_{ij} \sim \text{Pois}\left( s_j\; e^{q_{ij}} \right) $$
+
+In order to ensure identifiability, we require that $\|\mathbf{q}\|_2=1$. (Otherwise, $\mathbf{q}_j$ and $s_j$ would not be jointly identifiable.)
+
+Gene expression is well known to show multiplicative noise, which is why it is usually transformed to a logarithmic scale before applying differences or other statistics that require homoskedasticity. Therefore, it seems to make sense to me to consider Euclidean distances in *logarithmic* expression space as a useful measure of dissimilarity of the transcriptional state of two cells. We therefore take $d_{jj'}=\|\mathbf{q}_{j'}-\mathbf{q}_{j}\|$ as the "true expression distance" between cells $j$ and $j'$. 
+
+Our aim is to find a useful estimator for $d_{jj'}$ from the observed quantities $K_{ij}$ and $K_{ij'}$.
+
+<small>
+[Side remark (skip on first reading): Due to the normalization constraint $\|\mathbf{q}_j\|=1$, the cell's state vectors live on the surface of the $m$-dimensional unit hypersphere. Hence, instead of the Euclidean distance just proposed, it might seem more natural to use the geodesic distance on the hypersphere surface, which is given by $d_{jj'}^\text{sph} = \operatorname{arccos} ( \mathbf{q}_j\cdot\mathbf{q}_{j'})$. Note, however, that the two distances are related to each other by a monotonic transformation. As we will later be primarily interested in a ranking of distances, the Euclidean and the spherical distance are equivalent in that sense. (To see the relation between the two distances, note that due to the normalization constraint, $$d_{jj'}^2=\sum_i\left(q_{ij'}-q_{ij}\right)^2=\sum_i q_{ij'}^2-2\sum_i q_{ij'}q_{ij}+\sum_i q_{ij}^2=2-2\mathbf{q}_j\cdot\mathbf{q}_{j'}= 2(1-\cos d_{jj'}^\text{sph}).$$
+)]</small>
+
+### Conventional approach
+
+A conventional approach is as follows. We first convert the UMI counts into fractions (UMIs for one gene as fraction of all UMIs of the cell) by dividing the counts by the total UMI counts per cell:
+$$F_{ij} = K_{ij} \big/ \sum_{j'} K_{ij'}.$$
+Then, we transform to a logarithmic scale, via $Y_{ij}=\log(F_{ij}+\theta)$, using some offset, commonly (e.g., in Seurat) $\theta=10^{-4}$. 
+
+<small>[Side remark: Actually, Seurat uses $Y_{ij}=\log_2(F_{ij}/\theta+1)$. This, of course, just shifts everything by a constant.]</small>
+
+Finally, we take Euclidean distances on the scale of the $Y$'s:
+$$ D^\text{conv}_{jj'} = \sqrt{\sum_i \left(Y_{ij'} - Y_{ij}\right)^2}. $$
+We will now ask whether this quantity is a good estimator of $d_{jj'}$.
+
+<small>[Side remark: Often, the matrix formed by the $Y_{ij}$ is subjected to principal component analysis beforehand, and the sum in the formula for $D^\text{conv}_{jj'}$ then runs not over all genes $i$ but instead over the first few principal components. This willreduces the impact of the Poisson noise as there is typically substantial correlation between genes, and the Poisson noise (which is independent between genes) will hence accumulate in the later principal components, which are not part of the sum. For the arguments discussed below, however, this is probably not relevant.]</small>
+
+
+### A testbed for distance measures
+
+Let us consider an expression space spanned by $n=1000$ genes, and $m=200$ cells
+```{r}
+set.seed(1234567)
+
+m <- 1000
+n <- 200
+```
+
+We place a "cell of interest", $\mathbf{q}_0$, in this space by drawing the log expression of each gene from a suitable normal 
+```{r}
+q0 <- rnorm( m, sd=1.5 )
+```
+
+We now take $n$ more cells, which have succesively more distance to cell 0. We achieve this by mixing new normal variates with cell 0, as
+$$ \mathbf{q}_j = (1-\alpha_j) \mathbf{q}_0 + \alpha_j \mathbf{Q}_j,$$
+where $Q_{ij}$ are freshly drawn variates from the same normal, and $\alpha_j$ steadily increases, as $\alpha_j=j/n$.
+```{r}
+qs <- sapply( (1:n)/n, function(alpha)
+  (1-alpha) * q0 + alpha * rnorm( m, sd=1.5 ) )
+```
+
+We calculate the distances $\|\mathbf{q_0}-\mathbf{q}_j\|$ for $j=1,\dots,n$.
+```{r}
+truedists <- sapply( 1:n, function(j) 
+  sqrt( sum( ( q0 - qs[,j] )^2 ) ) )
+```
+
+
+Plot them:
+```{r}
+plot( 1:n, truedists )
+```
+
+We next assign to each cell a size factor, drawn from a log-normal
+```{r}
+sf <- exp( rnorm( n+1, mean=.7, sd=2 ) )
+```
+
+Now we simulate UMI counts according to our model
+```{r}
+counts <- 
+  sapply( 1:(n+1), function(j) 
+     rpois( m, sf[j] * exp( cbind( q0, qs )[,j] ) ) )
+```
+
+We now use the "conventional" approach described above (with $\theta=10^{-3}$)
+
+```{r}
+# Calculate UMI totals per cell
+totals <- colSums(counts)
+
+# Devide by totals to obtain fractions
+fracs <- t( t(counts) / totals )
+
+# Go to log scale
+expr <- log( fracs + 1e-3 )
+
+# Calculate distance matrix, take 1st row, i.e. distances to cell of interest
+# excluding the cell of interest
+dists <- as.matrix( dist( t(expr) ) )[1,-1]
+
+# Plot distances
+plot( 1:n, dists )
+```
+
+As one can see, most cells show distances to cell 0 that put the cells into correct order, with acceptable noise in ranking. Some cells, however, stick out, and the distance of these outliers tends to always be too high.
+
+Let us colour in red the third of the cells with the lowest count totals
+
+```{r}
+plot( 1:n, dists, 
+   col = ifelse( totals[-1] < quantile(totals,1/3), "red", "black" ) )
+```
+
+It is easy to see that the small cells (those with small count total) have the largest variance in their distance to cell 0. This is expected, and probably unavoidable; after all, these cells have the lowest information content. 
+
+However, the low cell size causes the distance estimates to not only have a higher variance but also an upwards bias! This should be avoidable.
+
+#### Where does this bias come from?
+
+When calculating a Euclidean distance, we add up \emph{squares} of terms of the form $(y_{ij'}-y_{ij})$. These terms have a higher variance if the size factors $s_j$ and $s_j'$ are small, because then, the count values $k_{ij}$ and $k_{ij'}$ on which they are based have strong Poisson noise. Squaring the terms turns this variance into a bias. (Consider how something similar happens when deriving the chi-squared distribution from a sum of squared normals.)
+
+#### Why is the bias an issue?
+
+In dimension-reduction plots, "small" cells (i.e., those with low totals) often separate from the larger cells within each cluster. In facts, most clusters show in internal gradient in cell size, which overshadows more interesting biological differences.
+
+A crucial intermediate data type in most single-cell analysis workflows is the nearest-neighbour graph, which is, for example, an input to both the t-SNE and the UMAP dimension reduction algorithm. The fact that smaller cells, even if they are actually nearby, will appear farther away, 
+is what causes them to be driven away from the "center" of clusters. The fact that they still appear together is due to the asymmetric character of nearest neighbourhood: 
+The small cells are not among the larger cells' nearest neighbours, but the opposite is the case. The nearest neighbours of a small cell are not the other similar small cells, but the similar larger cells.
+
+Nearest-neighbour graphs are not only an input to dimension reduction procedures but also to other methods, e.g. to denoising approaches, which, for example, smooth expression data by averaging over nearest neighbours. Here, it might be an advantage to preferedly average over larger cells, but this feels a bit like an accidental hack.
+
+### Conclusion: the task at hand
+
+It seems to me that it would be helpful to study this phenomenon in more details. The following questions seem to arise:
+
+1. Can we estimate a standard error for distance estimates? It seems that this standard error should mainly depend on the totals of the cells involved.
+
+2. Can we estimate the strength of the bias and reduce it, and in this manner remove or reduce the influence of cell size on neighbor ranking?
+
+3. Can we find a distance measure that more directly estimates $d_{jj'}$, by avoiding the awkward pseudocount $\theta$, and thus achieving better performance? Could it help to weight genes by expected information content? Or to use some kind of Poisson residuals instead of logarithms with pseudocount?
+
+4. What can we learn about the impact of cell totals on nearest-neighbour graphs? Can we improve them by taking into account uncertainty in neighbourhood ranking?
+
+The simulation provided above might be a suitable "test bed" to test ideas to address these questions.
